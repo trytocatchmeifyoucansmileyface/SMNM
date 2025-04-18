@@ -1,0 +1,3 @@
+on:
+  schedule:
+    - cron: "0 * * * *"     # runs at minute 0 of every hour UTC

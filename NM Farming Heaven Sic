@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NM Farming Heaven Sic
 // @namespace    http://tampermonkey.net/
-// @version      2.5.1  // <-- IMPORTANT: You will increase this number for each update.
+// @version      2.5.1 
 // @author       ByMe
 // @match        https://www.ninjamanager.com/forge*
 // @run-at       document-start

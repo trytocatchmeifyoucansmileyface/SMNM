@@ -1,0 +1,688 @@
+// ==UserScript==
+// @name         NM Farming Heaven Sic
+// @namespace    http://tampermonkey.net/
+// @version      2.5.1  // <-- IMPORTANT: You will increase this number for each update.
+// @author       ByMe
+// @match        https://www.ninjamanager.com/forge*
+// @run-at       document-start
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @grant        GM_addValueChangeListener
+// @grant        unsafeWindow
+// @icon         https://www.google.com/s2/favicons?sz=64&domain=ninjamanager.com
+// @downloadURL  https://raw.githubusercontent.com/YOUR_USERNAME/YOUR_REPO/main/nm-farming-heaven.user.js
+// @updateURL    https://raw.githubusercontent.com/YOUR_USERNAME/YOUR_REPO/main/nm-farming-heaven.user.js
+// ==/UserScript==
+(function() {
+    'use strict';
+
+    const VALUE_MULTIPLIER_TIERS = [
+        { threshold: 500, multiplier: 0.25 },
+        { threshold: 100, multiplier: 0.20 },
+        { threshold: 50,  multiplier: 0.15 },
+        { threshold: 10,  multiplier: 0.10 },
+        { threshold: 0,   multiplier: 0.05 }
+    ];
+
+    const STORAGE_KEYS = {
+        FARMING_LIST_KEY: 'nm_farming_list_v4',
+        INVENTORY_CACHE_KEY: 'nm_inventory_cache_v3',
+        COLLAPSE_STATE_KEY: 'nm_collapse_state_v3',
+        INGREDIENT_INFO_CACHE_KEY: 'nm_ingredient_info_cache_v2',
+        IF_VALUE_KEY: 'nm_if_value_v1',
+    };
+
+    const CACHE = {
+        trackedRecipes: {},
+        inventory: {},
+        collapseState: [],
+        ingredientInfoMap: {},
+        recipeOutcomeInfoMap: {},
+        userIF: 0,
+    };
+
+    const utils = {
+        debounce: (func, wait) => {
+            let timeout;
+            return function(...args) {
+                clearTimeout(timeout);
+                timeout = setTimeout(() => func.apply(this, args), wait);
+            };
+        },
+        createElement: (tag, className, innerHTML) => {
+            const el = document.createElement(tag);
+            if (className) el.className = className;
+            if (innerHTML) el.innerHTML = innerHTML;
+            return el;
+        },
+    };
+
+    const persistor = {
+        set: (key, value) => GM_setValue(key, value),
+        updateTracked: async (recipeId, quantity) => {
+            const newQty = parseInt(quantity, 10);
+            if (!isNaN(newQty) && newQty > 0) {
+                CACHE.trackedRecipes[recipeId] = newQty;
+            } else {
+                delete CACHE.trackedRecipes[recipeId];
+            }
+            await persistor.set(STORAGE_KEYS.FARMING_LIST_KEY, CACHE.trackedRecipes);
+            return !isNaN(newQty) && newQty > 0;
+        },
+        setInventory: async (inventory) => {
+            CACHE.inventory = inventory;
+            await persistor.set(STORAGE_KEYS.INVENTORY_CACHE_KEY, inventory);
+        },
+        toggleCollapseState: async (id) => {
+            CACHE.collapseState.has(id) ? CACHE.collapseState.delete(id) : CACHE.collapseState.add(id);
+            await persistor.set(STORAGE_KEYS.COLLAPSE_STATE_KEY, [...CACHE.collapseState]);
+        },
+    };
+
+    const materialFilter = {
+        isActive: false,
+        button: null,
+        init: function() {
+            if (document.getElementById('nm-unowned-filter-btn')) return;
+            const container = document.querySelector('.js-ingredients-sort[data-sortlist="material"] .m-button-list__container');
+            if (!container) return;
+            this.button = utils.createElement('div', 'c-filter-button', '<span>Unowned</span>');
+            this.button.id = 'nm-unowned-filter-btn';
+            this.button.title = 'Toggle to show only materials with a quantity of 0';
+            this.button.onclick = this.toggle.bind(this);
+            container.appendChild(this.button);
+        },
+        toggle: function() {
+            this.isActive = !this.isActive;
+            this.apply();
+        },
+        apply: function() {
+            if (!this.button) return;
+            document.querySelectorAll('#material-list .js-ingredient').forEach(material => {
+                const materialId = material.dataset.ingredientid;
+                if (!materialId) return;
+                const amount = CACHE.inventory[materialId] || 0;
+                material.style.display = (this.isActive && amount > 0) ? 'none' : '';
+            });
+            this.button.classList.toggle('-c-sel', this.isActive);
+        }
+    };
+
+    const forge = {
+        recalculateAndRender: async () => {
+            if (!unsafeWindow.jsData?.Recipes) return;
+            await forge.renderFarmingList();
+        },
+        init: async () => {
+            const waitForForgeData = (callback) => {
+                const interval = setInterval(() => {
+                    const isReady = unsafeWindow.jsData?.Recipes && unsafeWindow.jsData?.KnownRecipesData && document.querySelector('.js-ingredient[data-ingredientid]') && document.querySelector('#recipes-list .js-recipe');
+                    if (isReady) { clearInterval(interval); callback(); }
+                }, 250);
+            };
+            waitForForgeData(async () => {
+                await forge.buildIngredientInfoMaps();
+                await forge.injectUI();
+                materialFilter.init();
+                forge.attachRecipeListeners();
+                forge.attachGlobalListeners();
+                await forge.parseInventory();
+                await forge.recalculateAndRender();
+                GM_addValueChangeListener(STORAGE_KEYS.INVENTORY_CACHE_KEY, (name, old_value, new_value) => {
+                    CACHE.inventory = new_value;
+                    forge.recalculateAndRender();
+                });
+                const recipeListContainer = document.getElementById('recipes-list');
+                if (recipeListContainer) {
+                    new MutationObserver(() => {
+                        if (!recipeListContainer.dataset.trackingReady) {
+                            forge.attachRecipeListeners();
+                            recipeListContainer.dataset.trackingReady = 'true';
+                        }
+                    }).observe(recipeListContainer, { childList: true, subtree: true });
+                }
+            });
+        },
+        buildIngredientInfoMaps: async () => {
+            let cacheWasModified = false;
+            const processList = (selector, category) => {
+                document.querySelectorAll(selector).forEach(el => {
+                    const id = el.dataset.ingredientid;
+                    const itemTooltip = el.querySelector('.js-item-tooltip');
+                    if (!id || !itemTooltip || CACHE.ingredientInfoMap[id]) return;
+                    const nameEl = el.querySelector('.c-item__name');
+                    const iconEl = el.querySelector('img, .c-item__icon');
+                    const url = itemTooltip.dataset.url;
+                    const value = itemTooltip.dataset.value;
+                    if (nameEl && iconEl && url) {
+                        const identifier = url.split('/').pop();
+                        const info = { id, name: nameEl.textContent.trim(), icon: iconEl.tagName === 'IMG' ? iconEl.src : iconEl.className, iconType: iconEl.tagName === 'IMG' ? 'image' : 'css', category, identifier, value: parseInt(value, 10) || 0 };
+                        CACHE.ingredientInfoMap[id] = info;
+                        CACHE.ingredientInfoMap[identifier] = info;
+                        cacheWasModified = true;
+                    }
+                });
+            };
+            processList('#material-list .js-ingredient', 'Material');
+            processList('#equipment-list .js-ingredient', 'Item');
+            processList('#bloodlines-list .js-ingredient', 'Bloodline');
+            if (cacheWasModified) {
+                await persistor.set(STORAGE_KEYS.INGREDIENT_INFO_CACHE_KEY, CACHE.ingredientInfoMap);
+            }
+        },
+        parseInventory: async () => {
+            const inventory = {};
+            document.querySelectorAll('#material-list .js-ingredient').forEach(el => {
+                const id = el.dataset.ingredientid;
+                if (id) {
+                    const amountEl = el.querySelector('.c-item__amount');
+                    inventory[id] = amountEl ? parseInt(amountEl.textContent.replace(/,/g, '')) : 1;
+                }
+            });
+            await persistor.setInventory(inventory);
+        },
+        injectUI: async () => {
+            const container = utils.createElement('div');
+            container.id = 'nm-script-main-container';
+            container.innerHTML = `
+                <div class="farm-list-header">
+                    <div class="c-page-desc"><h2>Farming List</h2></div>
+                    <div class="farm-list-header-controls">
+                        <div class="if-input-container">
+                            <label for="nm-if-input">Your ItemFind:</label>
+                            <input type="number" id="nm-if-input" class="if-input" value="0" min="0">
+                        </div>
+                        <div id="nm-time-estimate-container" class="time-estimate-container"></div>
+                    </div>
+                </div>
+                <div id="tracked-items-list"></div>
+            `;
+            document.querySelector('.p-forge-ingredients-desc')?.parentNode.insertBefore(container, document.querySelector('.p-forge-ingredients-desc'));
+        },
+        attachGlobalListeners: () => {
+            const container = document.getElementById('nm-script-main-container');
+            if (!container || container.dataset.listenersAttached) return;
+
+            container.addEventListener('click', async (e) => {
+                const removeBtn = e.target.closest('.remove-farm-item');
+                if (removeBtn) {
+                    const recipeId = removeBtn.dataset.recipeId;
+                    const recipeRow = document.querySelector(`.m-sb-recipes__row.js-recipe[data-recipeid="${recipeId}"]`);
+                    if (recipeRow) {
+                        await forge.handleRecipeTrack(recipeId, recipeRow);
+                    }
+                    return;
+                }
+
+                const copyBtn = e.target.closest('.copy-farm-item');
+                if (copyBtn) {
+                    const recipeId = copyBtn.dataset.recipeId;
+                    const quantity = CACHE.trackedRecipes[recipeId] || 1;
+                    const textTree = forge.generateDiscordTree(recipeId, quantity);
+                    navigator.clipboard.writeText(textTree).then(() => {
+                        copyBtn.textContent = '✅';
+                        copyBtn.style.pointerEvents = 'none';
+                        setTimeout(() => {
+                            copyBtn.textContent = '📋';
+                            copyBtn.style.pointerEvents = 'auto';
+                        }, 1500);
+                    }).catch(err => {
+                        console.error('NM Script: Could not copy text: ', err);
+                        copyBtn.textContent = '❌';
+                        setTimeout(() => { copyBtn.textContent = '📋'; }, 1500);
+                    });
+                    return;
+                }
+
+                const mainHeader = e.target.closest('.collapsible-main-header');
+                if (mainHeader && !e.target.closest('.remove-farm-item, .farm-item-qty-input, .copy-farm-item')) {
+                    const itemContainer = mainHeader.closest('.farm-item-container');
+                    itemContainer.classList.toggle('collapsed');
+                    await persistor.toggleCollapseState(itemContainer.dataset.recipeId);
+                    return;
+                }
+
+                const treeBranch = e.target.closest('.farm-crafted-item');
+                if (treeBranch) {
+                    const matContainer = treeBranch.closest('.farm-material-container');
+                    const tree = matContainer.querySelector('.farm-material-tree');
+                    if (tree) {
+                        treeBranch.classList.toggle('collapsed');
+                        tree.classList.toggle('collapsed');
+                    }
+                    return;
+                }
+            });
+
+            const handleQuantityChange = utils.debounce(async (target) => {
+                const recipeId = target.dataset.recipeId;
+                const newQuantity = parseInt(target.value, 10);
+                if (recipeId && !isNaN(newQuantity)) {
+                    await persistor.updateTracked(recipeId, newQuantity);
+                    await forge.recalculateAndRender();
+                }
+            }, 500);
+
+            container.addEventListener('change', (e) => {
+                if (e.target.matches('.farm-item-qty-input')) {
+                    handleQuantityChange(e.target);
+                }
+            });
+
+            const handleIfChange = utils.debounce(async (target) => {
+                const newIf = parseInt(target.value, 10);
+                if (!isNaN(newIf) && newIf >= 0) {
+                    CACHE.userIF = newIf;
+                    await persistor.set(STORAGE_KEYS.IF_VALUE_KEY, newIf);
+                    await forge.recalculateAndRender();
+                }
+            }, 500);
+
+            container.addEventListener('input', (e) => {
+                if (e.target.matches('#nm-if-input')) {
+                    handleIfChange(e.target);
+                }
+            });
+
+            container.dataset.listenersAttached = 'true';
+        },
+        attachRecipeListeners: () => {
+            const recipeContainer = document.querySelector('.m-sb-recipes');
+            if (!recipeContainer) return;
+
+            if (!recipeContainer.dataset.mainListenerAttached) {
+                recipeContainer.addEventListener('click', async (e) => {
+                    const row = e.target.closest('.m-sb-recipes__row.js-recipe');
+                    if (!row) return;
+                    const recipeId = row.dataset.recipeid;
+                    const trackBtn = e.target.closest('.track-recipe-btn');
+                    if (trackBtn) {
+                        e.stopPropagation();
+                        e.preventDefault();
+                        await forge.handleRecipeTrack(recipeId, row);
+                    }
+                });
+                recipeContainer.addEventListener('contextmenu', async (e) => {
+                    const row = e.target.closest('.m-sb-recipes__row.js-recipe');
+                    if (row) {
+                        e.preventDefault();
+                        await forge.handleRecipeTrack(row.dataset.recipeid, row);
+                    }
+                });
+                recipeContainer.dataset.mainListenerAttached = 'true';
+            }
+
+            document.querySelectorAll('.m-sb-recipes__row.js-recipe').forEach(row => {
+                if (row.querySelector('.track-recipe-btn')) {
+                    const recipeId = row.dataset.recipeid;
+                    const isTracking = !!CACHE.trackedRecipes[recipeId];
+                    row.classList.toggle('recipe-is-tracked', isTracking);
+                    row.querySelector('.track-recipe-btn').classList.toggle('tracking', isTracking);
+                    return;
+                }
+
+                const recipeId = row.dataset.recipeid;
+                if (!recipeId) return;
+                const nameEl = row.querySelector('.m-sb-recipes__name span');
+                const iconPicEl = row.querySelector('.m-sb-recipes__pic img');
+                const iconCssEl = row.querySelector('.m-sb-recipes__icon');
+                if (nameEl && (iconPicEl || iconCssEl)) {
+                    CACHE.recipeOutcomeInfoMap[recipeId] = { name: nameEl.textContent.trim(), icon: iconPicEl ? iconPicEl.src : row.className.match(/h-item-[\w-]+ h-item-icon--[\w-]+/)[0], iconType: iconPicEl ? 'image' : 'css', };
+                }
+                const icon = utils.createElement('div', 'track-recipe-btn', '🎯');
+                icon.title = "Track Recipe (Click or Right-Click Row)";
+                row.appendChild(icon);
+                if (CACHE.trackedRecipes[recipeId]) {
+                    icon.classList.add('tracking');
+                    row.classList.add('recipe-is-tracked');
+                }
+            });
+            forge.sortRecipeList();
+        },
+        sortRecipeList: () => {
+            const recipeContainer = document.querySelector('.m-sb-recipes');
+            if (!recipeContainer) return;
+            let farmListCategory = document.getElementById('nm-farm-list-category');
+            if (Object.keys(CACHE.trackedRecipes).length > 0) {
+                if (!farmListCategory) {
+                    farmListCategory = utils.createElement('div', 'm-sb-recipes__category', '<span>Farm List</span>');
+                    farmListCategory.id = 'nm-farm-list-category';
+                    recipeContainer.prepend(farmListCategory);
+                }
+                document.querySelectorAll('.recipe-is-tracked').forEach(row => farmListCategory.after(row));
+            } else {
+                farmListCategory?.remove();
+            }
+        },
+        handleRecipeTrack: async (recipeId, rowElement) => {
+            const isCurrentlyTracking = !!CACHE.trackedRecipes[recipeId];
+            const isNowTracking = await persistor.updateTracked(recipeId, isCurrentlyTracking ? 0 : 1);
+            rowElement.classList.toggle('recipe-is-tracked', isNowTracking);
+            rowElement.querySelector('.track-recipe-btn')?.classList.toggle('tracking', isNowTracking);
+            const flashClass = isNowTracking ? 'recipe-tracked-flash-add' : 'recipe-tracked-flash-remove';
+            rowElement.classList.remove('recipe-tracked-flash-add', 'recipe-tracked-flash-remove');
+            void rowElement.offsetWidth;
+            rowElement.classList.add(flashClass);
+            forge.sortRecipeList();
+            await forge.recalculateAndRender();
+            forge.attachRecipeListeners();
+        },
+        calculateRequirements: (recipeId, quantity = 1) => {
+            const processRecipe = (recId, quantityMultiplier = 1, visited = new Set()) => {
+                visited.add(recId);
+                const recipe = unsafeWindow.jsData.Recipes[recId];
+                if (!recipe || !recipe.Ingredients) return [];
+                let materials = [];
+                const processCategory = (ingredients, category) => {
+                    if (!ingredients) return;
+                    for (const id in ingredients) {
+                        const neededTotal = ingredients[id] * quantityMultiplier;
+                        const subRecipeId = Object.keys(unsafeWindow.jsData.KnownRecipesData).find(knownId => {
+                            const recipeData = unsafeWindow.jsData.KnownRecipesData[knownId];
+                            return recipeData?.Outcome?.ID == id && recipeData.Category.toLowerCase() === category.toLowerCase();
+                        });
+
+                        let shouldBreakdown = !!subRecipeId;
+                        if (shouldBreakdown && unsafeWindow.jsData.KnownRecipesData[subRecipeId].Category.toLowerCase() === 'bloodline') {
+                            shouldBreakdown = false;
+                        }
+
+                        if (shouldBreakdown) {
+                            const have = CACHE.inventory[id] || 0;
+                            const missingQuantity = Math.max(0, neededTotal - have);
+                            if (missingQuantity > 0) {
+                                materials.push({ id, isCraft: true, needed: neededTotal, subMaterials: processRecipe(subRecipeId, missingQuantity, new Set(visited)) });
+                            } else {
+                                materials.push({ id, isCraft: true, needed: neededTotal, subMaterials: [] });
+                            }
+                        } else {
+                            materials.push({ id, isCraft: !!subRecipeId, needed: neededTotal, subMaterials: [] });
+                        }
+                    }
+                };
+                processCategory(recipe.Ingredients.Material, 'material');
+                processCategory(recipe.Ingredients.Item, 'item');
+                return materials;
+            };
+            return processRecipe(recipeId, quantity);
+        },
+        createIconHTML: (iconInfo, isHeader = false) => {
+            if (!iconInfo) return '<div class="item-icon"></div>';
+            if (iconInfo.iconType === 'image') return `<div class="item-icon"><img src="${iconInfo.icon}"></div>`;
+            const baseClass = isHeader ? 'm-sb-recipes__row' : 'c-item';
+            return `<div class="${baseClass} ${iconInfo.icon}"><div class="m-sb-recipes__icon a-item-icon"></div></div>`;
+        },
+        getEffectivenessMultiplier: (value) => {
+            for (const tier of VALUE_MULTIPLIER_TIERS) {
+                if (value >= tier.threshold) {
+                    return tier.multiplier;
+                }
+            }
+            return 0;
+        },
+        getAdjustedWEcost: (value, userIF) => {
+            if (userIF <= 0) return value;
+            const effectivenessMultiplier = forge.getEffectivenessMultiplier(value);
+            const effectiveBonus = (userIF / 100) * effectivenessMultiplier;
+            return value / (1 + effectiveBonus);
+        },
+        processRequirementsTree: (nodes) => {
+            const allNeeds = {};
+            let totalAdjustedWE = 0;
+            const processNode = (node) => {
+                const materialInfo = CACHE.ingredientInfoMap[node.id];
+                if (!materialInfo) return;
+                if (!node.isCraft && materialInfo.category === 'Material') {
+                    const needed = Math.max(0, node.needed - (CACHE.inventory[node.id] || 0));
+                    totalAdjustedWE += forge.getAdjustedWEcost(materialInfo.value, CACHE.userIF) * needed;
+                }
+                const identifier = materialInfo.identifier;
+                if (!allNeeds[identifier]) allNeeds[identifier] = { needed: 0, name: materialInfo.name, iconInfo: materialInfo, id: node.id };
+                allNeeds[identifier].needed += node.needed;
+                if (node.subMaterials?.length > 0) {
+                    node.subMaterials.forEach(processNode);
+                }
+            };
+            nodes.forEach(processNode);
+            return { allNeeds, totalAdjustedWE };
+        },
+        generateDiscordTree: (recipeId, quantity) => {
+            const recipeInfo = unsafeWindow.jsData.KnownRecipesData[recipeId];
+            const outcomeInfo = CACHE.recipeOutcomeInfoMap[recipeId];
+            if (!recipeInfo || !outcomeInfo) return 'Error: Could not generate tree.';
+
+            let categoryTag = '';
+            if (outcomeInfo.iconType === 'css') {
+                if (outcomeInfo.icon.includes('h-item-lw-')) categoryTag = '[LW] ';
+                else if (outcomeInfo.icon.includes('h-item-bloodline')) categoryTag = '[BL] ';
+            }
+            if (!categoryTag && recipeInfo.Category) {
+                categoryTag = `[${recipeInfo.Category.toUpperCase()}] `;
+            }
+
+            let output = `**${categoryTag}${recipeInfo.Outcome.Name} (Qty: ${quantity})**\n`;
+            const requirementsTree = forge.calculateRequirements(recipeId, quantity, CACHE.strategyMap);
+
+            const _traverseNodes = (nodes, depth = 0) => {
+                for (const node of nodes) {
+                    const materialInfo = CACHE.ingredientInfoMap[node.id];
+                    if (!materialInfo) continue;
+
+                    const have = CACHE.inventory[node.id] || 0;
+                    const needed = Math.ceil(node.needed);
+
+                    if (have < needed) {
+                        const indent = '  '.repeat(depth);
+                        output += `${indent}- ${materialInfo.name} (${have} / ${needed})\n`;
+
+                        if (node.subMaterials?.length > 0) {
+                            _traverseNodes(node.subMaterials, depth + 1);
+                        }
+                    }
+                }
+            };
+
+            _traverseNodes(requirementsTree);
+            return output;
+        },
+        renderFarmingList: async () => {
+            const listContainer = document.getElementById('tracked-items-list');
+            const mainContainer = document.getElementById('nm-script-main-container');
+            if (!listContainer || !mainContainer) return;
+
+            const header = mainContainer.querySelector('.farm-list-header');
+            if (!header) return;
+
+            const hasTrackedItems = Object.keys(CACHE.trackedRecipes).length > 0;
+
+            header.style.display = hasTrackedItems ? '' : 'none';
+            listContainer.innerHTML = '';
+
+            if (!hasTrackedItems) {
+                const timeContainer = document.getElementById('nm-time-estimate-container');
+                if(timeContainer) timeContainer.innerHTML = '';
+                return;
+            }
+
+            const ifInput = document.getElementById('nm-if-input');
+            if (ifInput) ifInput.value = CACHE.userIF;
+
+            let grandTotalWE = 0;
+            for (const recipeId in CACHE.trackedRecipes) {
+                const quantity = CACHE.trackedRecipes[recipeId];
+                const recipeInfo = unsafeWindow.jsData.KnownRecipesData[recipeId];
+                if (!recipeInfo) continue;
+
+                const outcomeInfo = CACHE.recipeOutcomeInfoMap[recipeId];
+                const requirementsTree = forge.calculateRequirements(recipeId, quantity);
+                const { allNeeds: itemFinalReqs, totalAdjustedWE } = forge.processRequirementsTree(requirementsTree);
+                grandTotalWE += totalAdjustedWE;
+                const isReadyToCraft = !Object.keys(itemFinalReqs).some(id => (CACHE.inventory[itemFinalReqs[id].id] || 0) < itemFinalReqs[id].needed);
+                const isExpanded = !CACHE.collapseState.has(recipeId);
+
+                const itemContainer = utils.createElement('div', `farm-item-container ${isExpanded ? '' : 'collapsed'} ${isReadyToCraft ? 'is-ready-to-craft' : ''}`);
+                itemContainer.dataset.recipeId = recipeId;
+
+                const isBloodline = outcomeInfo?.iconType === 'css' && outcomeInfo.icon.includes('h-item-bloodline');
+                const isLW = outcomeInfo?.iconType === 'css' && outcomeInfo.icon.includes('h-item-lw-');
+                const controlsHTML = `<div class="farm-item-controls">${!isBloodline && !isLW ? `<div class="farm-item-quantity-controls"><label>Qty:</label><input type="number" class="farm-item-qty-input" value="${quantity}" data-recipe-id="${recipeId}" min="1"></div>` : ''}<span class="copy-farm-item" data-recipe-id="${recipeId}" title="Copy for Discord">📋</span><span class="remove-farm-item" data-recipe-id="${recipeId}">×</span></div>`;
+
+                itemContainer.innerHTML = `<div class="farm-item-header collapsible-main-header">${forge.createIconHTML(outcomeInfo, true)}<span>${recipeInfo.Outcome.Name}</span>${controlsHTML}</div>`;
+                const materialsList = utils.createElement('div', 'farm-item-materials');
+                materialsList.innerHTML = forge.renderMaterialTree(requirementsTree);
+                itemContainer.appendChild(materialsList);
+                listContainer.appendChild(itemContainer);
+            }
+
+            const timeContainer = document.getElementById('nm-time-estimate-container');
+            if (timeContainer) {
+                if (grandTotalWE > 0) {
+                    const totalDays = grandTotalWE / 144;
+                    const days = Math.floor(totalDays);
+                    const hours = Math.round((totalDays - days) * 24);
+                    timeContainer.innerHTML = `<span>Est. Farm Time: <b>${days}d ${hours}h</b></span>`;
+                } else {
+                    timeContainer.innerHTML = `<span>All materials farmed!</span>`;
+                }
+            }
+        },
+        renderMaterialTree: (nodes) => {
+            const _renderNode = (node) => {
+                const materialInfo = CACHE.ingredientInfoMap[node.id];
+                if (!materialInfo) return '';
+                const have = CACHE.inventory[node.id] || 0;
+                const needed = Math.ceil(node.needed);
+                const progressPercent = Math.min((needed > 0 ? have / needed : 1) * 100, 100);
+                const isCraftable = node.isCraft, hasSubMaterials = node.subMaterials?.length > 0;
+                let headerClass = `farm-material-item ${isCraftable ? 'farm-crafted-item' : ''} ${hasSubMaterials ? 'collapsible-header' : ''}`;
+
+                let html = `<div class="farm-material-container"><div class="${headerClass}">${forge.createIconHTML(materialInfo)}<span>${materialInfo.name}</span><span class="progress-text ${have >= needed ? 'progress-complete' : ''}">(${have} / ${needed})</span></div><div class="farm-item-progress-bar"><div class="farm-item-progress-bar-fill" style="width: ${progressPercent}%;"></div></div>`;
+                if (hasSubMaterials) {
+                    html += `<div class="farm-material-tree collapsed">${node.subMaterials.map(_renderNode).join('')}</div>`;
+                }
+                html += `</div>`;
+                return html;
+            };
+            return nodes.map(_renderNode).join('');
+        },
+    };
+
+    const injectStyles = () => {
+        if (document.getElementById('nm-styles')) return;
+        const style = utils.createElement('style');
+        style.id = 'nm-styles';
+        style.textContent = `
+            #nm-script-main-container { margin-top: 20px; }
+            .farm-item-container { background: rgba(0,0,0,0.2); border-radius: 4px; padding: 10px; margin-bottom: 10px; }
+            .farm-item-header { display: flex; align-items: center; font-size: 16px; font-weight: bold; color: #ffb546; gap: 8px; }
+            .farm-item-header .item-icon { margin-right: 8px; width: 24px; height: 24px; }
+            .farm-item-header .item-icon img { width: 100%; height: 100%; }
+            .farm-item-header.collapsible-main-header { cursor: pointer; position: relative; padding-left: 15px; }
+            .farm-item-header.collapsible-main-header::before { content: ''; position: absolute; left: 2px; top: 50%; width: 0; height: 0; border-style: solid; border-width: 5px 0 5px 8px; border-color: transparent transparent transparent #ffb546; transform: translateY(-50%) rotate(0deg); transition: transform 0.2s ease, border-color 0.2s ease; }
+            .farm-item-container:not(.collapsed) .farm-item-header.collapsible-main-header::before { transform: translateY(-50%) rotate(90deg); }
+            .farm-item-header.collapsible-main-header:hover::before { border-color: transparent transparent transparent #fff; }
+            .farm-item-container.collapsed .farm-item-materials { display: none; }
+            .farm-item-materials { padding-left: 20px; margin-top: 5px; }
+            .farm-material-item { display: flex; align-items: center; margin: 3px 0; font-size: 13px; color: #ddd; gap: 6px; }
+            .farm-material-item .item-icon { margin-right: 6px; width: 18px; height: 18px; flex-shrink: 0; }
+            .farm-material-item .item-icon img { width: 100%; height: 100%; }
+            .farm-material-item .progress-text { margin-left: 8px; font-weight: bold; color: #aaa; }
+            .progress-complete { color: #2ccc1f !important; }
+            .track-recipe-btn { cursor: pointer; margin-left: auto; font-size: 14px; transition: all 0.2s ease; padding: 1px 3px; display: flex; align-items: center; justify-content: center; user-select: none; border-radius: 4px; }
+            .track-recipe-btn:not(.tracking) { filter: grayscale(100%); opacity: 0.5; }
+            .track-recipe-btn.tracking { filter: grayscale(0%); opacity: 1; transform: scale(1.1); }
+            .track-recipe-btn:hover { background-color: rgba(255,255,255,0.1); }
+            .m-sb-recipes__row { position: relative; transition: background-color: 0.3s ease; }
+            .recipe-is-tracked { background-color: rgba(92, 184, 92, 0.75) !important; border-left: 4px solid #6aff5e; }
+            .recipe-tracked-flash-add { animation: flash-green 0.7s ease; }
+            .recipe-tracked-flash-remove { animation: flash-red 0.7s ease; }
+            @keyframes flash-green { 0% { background-color: rgba(92, 184, 92, 0.6); } 100% { background-color: transparent; } }
+            @keyframes flash-red { 0% { background-color: rgba(169, 68, 66, 0.6); } 100% { background-color: transparent; } }
+            .farm-material-tree { padding-left: 20px; border-left: 1px solid #444; margin-left: 8px; transition: all 0.3s ease; }
+            .farm-material-tree.collapsed { display: none; }
+            .farm-crafted-item { font-weight: bold; color: #e0a858; cursor: pointer; }
+            .collapsible-header::before { content: ''; display: inline-block; width: 0; height: 0; border-style: solid; border-width: 4px 0 4px 6px; border-color: transparent transparent transparent #ffb546; margin-right: 6px; transform: rotate(0deg); transition: transform 0.2s ease, border-color 0.2s ease; }
+            .collapsible-header.collapsed::before { transform: rotate(90deg); }
+            .farm-list-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; flex-wrap: wrap; gap: 10px; }
+            .farm-material-container { margin-bottom: 5px; }
+            .farm-item-progress-bar { width: 100%; height: 5px; background-color: rgba(0,0,0,0.3); border-radius: 3px; border: 1px solid #555; overflow: hidden; margin-top: 3px; }
+            .farm-item-progress-bar-fill { height: 100%; background-color: #5cb85c; border-radius: 3px; transition: width 0.3s ease; }
+            .farm-item-header > span { flex-grow: 1; }
+            .farm-item-controls { display: flex; align-items: center; gap: 8px; margin-left: auto; }
+            .farm-item-quantity-controls { display: flex; align-items: center; gap: 5px; }
+            .farm-item-quantity-controls label { font-size: 12px; color: #ccc; font-weight: normal; }
+            .farm-item-qty-input { width: 50px; padding: 2px 4px; background: #222; border: 1px solid #555; color: white; border-radius: 4px; text-align: center; }
+            .farm-item-header .remove-farm-item, .farm-item-header .copy-farm-item { margin-left: 0; cursor: pointer; font-size: 16px; font-weight: bold; transition: all 0.2s ease; width: 25px; height: 25px; display: flex; align-items: center; justify-content: center; border-radius: 4px; padding: 0; line-height: 1; }
+            .farm-item-header .remove-farm-item { color: #a94442; }
+            .farm-item-header .remove-farm-item:hover { color: #fff; background-color: #ff6b6b; }
+            .farm-item-header .copy-farm-item { color: #88caff; }
+            .farm-item-header .copy-farm-item:hover { color: #fff; background-color: #007bff; }
+            .farm-item-qty-input { -moz-appearance: textfield; }
+            .farm-item-qty-input::-webkit-outer-spin-button, .farm-item-qty-input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+            .farm-item-container.is-ready-to-craft { border-left: 4px solid #5cb85c; background-color: rgba(92, 184, 92, 0.15); }
+            .farm-list-header-controls { display: flex; align-items: center; gap: 20px; margin-left: auto; }
+            .if-input-container { display: flex; align-items: center; gap: 8px; }
+            .if-input-container label { font-size: 13px; color: #ccc; font-weight: normal; }
+            #nm-if-input { width: 60px; padding: 2px 4px; background: #222; border: 1px solid #555; color: white; border-radius: 4px; text-align: center; }
+            #nm-if-input { -moz-appearance: textfield; }
+            #nm-if-input::-webkit-outer-spin-button, #nm-if-input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+            .time-estimate-container { font-size: 14px; color: #ddd; }
+            .time-estimate-container b { color: #5cb85c; }
+        `;
+        document.head.appendChild(style);
+    };
+
+    const loadAllDataIntoCache = async () => {
+        const [
+            farmingList, inventory, collapseState, ingredientInfo, userIF
+        ] = await Promise.all([
+            GM_getValue(STORAGE_KEYS.FARMING_LIST_KEY, {}),
+            GM_getValue(STORAGE_KEYS.INVENTORY_CACHE_KEY, {}),
+            GM_getValue(STORAGE_KEYS.COLLAPSE_STATE_KEY, []),
+            GM_getValue(STORAGE_KEYS.INGREDIENT_INFO_CACHE_KEY, {}),
+            GM_getValue(STORAGE_KEYS.IF_VALUE_KEY, 0),
+        ]);
+
+        CACHE.trackedRecipes = farmingList;
+        CACHE.inventory = inventory;
+        CACHE.collapseState = new Set(collapseState);
+        CACHE.ingredientInfoMap = ingredientInfo;
+        CACHE.userIF = userIF;
+    };
+
+    const runInitialization = async () => {
+        injectStyles();
+        if (window.location.pathname.includes('/forge')) {
+            forge.init();
+        }
+    };
+
+    const observePageChanges = () => {
+        const targetNode = document.getElementById('content');
+        if (!targetNode) {
+            setTimeout(observePageChanges, 250);
+            return;
+        }
+        let lastPath = window.location.pathname;
+        const debouncedInit = utils.debounce(() => {
+            if (window.location.pathname !== lastPath) {
+                lastPath = window.location.pathname;
+                runInitialization();
+            }
+        }, 200);
+        new MutationObserver(debouncedInit).observe(targetNode, { childList: true, subtree: true });
+    };
+
+    const main = async () => {
+        await loadAllDataIntoCache();
+        runInitialization();
+        observePageChanges();
+    };
+
+    if (document.readyState === 'loading') {
+        window.addEventListener('DOMContentLoaded', main);
+    } else {
+        main();
+    }
+
+})();

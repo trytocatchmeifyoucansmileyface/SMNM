@@ -10,8 +10,8 @@
 // @grant        GM_addValueChangeListener
 // @grant        unsafeWindow
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=ninjamanager.com
-// @downloadURL  https://raw.githubusercontent.com/YOUR_USERNAME/YOUR_REPO/main/nm-farming-heaven.user.js
-// @updateURL    https://raw.githubusercontent.com/YOUR_USERNAME/YOUR_REPO/main/nm-farming-heaven.user.js
+// @downloadURL  hhttps://raw.githubusercontent.com/trytocatchmeifyoucansmileyface/SMNM/refs/heads/main/NM%20Farming%20Heaven%20Sic
+// @updateURL    https://raw.githubusercontent.com/trytocatchmeifyoucansmileyface/SMNM/refs/heads/main/NM%20Farming%20Heaven%20Sic
 // ==/UserScript==
 (function() {
     'use strict';

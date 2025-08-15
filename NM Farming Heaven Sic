@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NM Farming Heaven Sic
 // @namespace    http://tampermonkey.net/
-// @version      2.5.1 
+// @version      2.5.2
 // @author       ByMe
 // @match        https://www.ninjamanager.com/forge*
 // @run-at       document-start
@@ -17,7 +17,7 @@
     'use strict';
 
     const VALUE_MULTIPLIER_TIERS = [
-        { threshold: 500, multiplier: 0.25 },
+        { threshold: 500, multiplier: 01.25 },
         { threshold: 100, multiplier: 0.20 },
         { threshold: 50,  multiplier: 0.15 },
         { threshold: 10,  multiplier: 0.10 },
